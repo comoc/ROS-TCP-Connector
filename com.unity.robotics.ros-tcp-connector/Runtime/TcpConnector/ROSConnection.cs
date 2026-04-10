@@ -105,6 +105,39 @@ namespace Unity.Robotics.ROSTCPConnector
         int m_NextSrvID = 101;
         Dictionary<int, TaskPauser> m_ServicesWaiting = new Dictionary<int, TaskPauser>();
 
+        /// <summary>
+        /// Allocate a service request ID and create a TaskPauser that will be
+        /// resumed when the matching __response arrives. Used internally by
+        /// ROSActionClient and ROSActionServer to share the existing service
+        /// request/response infrastructure for action calls.
+        /// </summary>
+        internal (int srvId, TaskPauser pauser) AllocateServiceRequest()
+        {
+            var pauser = new TaskPauser();
+            int srvId;
+            lock (m_ServiceRequestLock)
+            {
+                srvId = m_NextSrvID++;
+                m_ServicesWaiting.Add(srvId, pauser);
+            }
+            return (srvId, pauser);
+        }
+
+        /// <summary>
+        /// Serialize a Message as a raw data frame (destination + CDR payload)
+        /// and enqueue it. Used by ROSActionClient/Server to send the data
+        /// frame that follows an action syscommand, without triggering
+        /// Publish()'s publisher-registration check.
+        /// </summary>
+        internal void QueueRawMessage(string destination, Message message)
+        {
+            m_MessageSerializer.Clear();
+            m_MessageSerializer.Write(destination);
+            m_MessageSerializer.SerializeMessageWithLength(message);
+            m_OutgoingMessageQueue.Enqueue(
+                new SysCommandSender(m_MessageSerializer.GetBytesSequence()));
+        }
+
         public bool listenForTFMessages = true;
 
         float m_LastMessageReceivedRealtime;
@@ -319,6 +352,77 @@ namespace Unity.Robotics.ROSTCPConnector
             return result;
         }
 
+        // --- Action support ---
+
+        // Registered action servers, keyed by action name.
+        Dictionary<string, object> m_ActionServers = new Dictionary<string, object>();
+
+        /// <summary>
+        /// Create an Action client for calling a ROS2 action server.
+        /// Requires the patched comoc/ROS-TCP-Endpoint (main-ros2 branch).
+        /// </summary>
+        public ROSActionClient<TGoal, TResult, TFeedback> CreateActionClient<TGoal, TResult, TFeedback>(
+            string actionName, string actionType = null)
+            where TGoal : Message, new()
+            where TResult : Message, new()
+            where TFeedback : Message, new()
+        {
+            if (string.IsNullOrEmpty(actionType))
+            {
+                // Derive from TGoal's RosMessageName by stripping the _Goal suffix
+                // e.g. "example_interfaces/Fibonacci_Goal" -> "example_interfaces/Fibonacci"
+                string goalName = MessageRegistry.GetRosMessageName<TGoal>();
+                if (goalName.EndsWith("_Goal"))
+                    actionType = goalName.Substring(0, goalName.Length - 5);
+                else
+                    actionType = goalName;
+            }
+            return new ROSActionClient<TGoal, TResult, TFeedback>(this, actionName, actionType);
+        }
+
+        /// <summary>
+        /// Create an Action server implemented in Unity.
+        /// Requires the patched comoc/ROS-TCP-Endpoint (main-ros2 branch).
+        /// </summary>
+        public ROSActionServer<TGoal, TResult, TFeedback> CreateActionServer<TGoal, TResult, TFeedback>(
+            string actionName, string actionType = null)
+            where TGoal : Message, new()
+            where TResult : Message, new()
+            where TFeedback : Message, new()
+        {
+            if (string.IsNullOrEmpty(actionType))
+            {
+                string goalName = MessageRegistry.GetRosMessageName<TGoal>();
+                if (goalName.EndsWith("_Goal"))
+                    actionType = goalName.Substring(0, goalName.Length - 5);
+                else
+                    actionType = goalName;
+            }
+            var server = new ROSActionServer<TGoal, TResult, TFeedback>(this, actionName, actionType);
+            m_ActionServers[actionName] = server;
+            server.EnsureRegistered();
+            return server;
+        }
+
+        /// <summary>
+        /// Route a __request payload to an action server if the destination
+        /// matches a registered action. Returns true if handled.
+        /// Called from the syscommand dispatcher.
+        /// </summary>
+        internal bool TryRouteToActionServer(int srvId, string destination, byte[] data)
+        {
+            if (m_ActionServers.TryGetValue(destination, out var serverObj))
+            {
+                // serverObj is ROSActionServer<,,> but we stored it as object.
+                // Use reflection to call OnGoalRequest.
+                var method = serverObj.GetType().GetMethod("OnGoalRequest",
+                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+                method?.Invoke(serverObj, new object[] { srvId, data });
+                return true;
+            }
+            return false;
+        }
+
         public void GetTopicList(Action<string[]> callback)
         {
             m_TopicsListCallbacks.Add(callback);
@@ -443,7 +547,7 @@ namespace Unity.Robotics.ROSTCPConnector
             if (_instance == null)
             {
                 // Prefer to use the ROSConnection in the scene, if any
-                _instance = FindObjectOfType<ROSConnection>();
+                _instance = FindAnyObjectByType<ROSConnection>();
                 if (_instance != null)
                     return _instance;
 
@@ -684,10 +788,16 @@ namespace Unity.Robotics.ROSTCPConnector
                     {
                         var serviceCommand = JsonUtility.FromJson<SysCommand_Service>(json);
 
-                        // the next incoming message will be a request for a Unity service, so set a special callback to process it
+                        // the next incoming message will be a request for a Unity service
+                        // (or an action goal from the endpoint's RosActionServer),
+                        // so set a special callback to process it
                         m_SpecialIncomingMessageHandler = (string serviceTopic, byte[] requestBytes) =>
                         {
                             m_SpecialIncomingMessageHandler = null;
+
+                            // Try action servers first (they use the same __request mechanism).
+                            if (TryRouteToActionServer(serviceCommand.srv_id, serviceTopic, requestBytes))
+                                return;
 
                             RosTopicState topicState = GetTopic(serviceTopic);
                             if (topicState == null)
