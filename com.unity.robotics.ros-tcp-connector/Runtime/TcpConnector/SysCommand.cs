@@ -23,6 +23,15 @@ namespace Unity.Robotics.ROSTCPConnector
         public const string k_SysCommand_RemoveRosService = "__remove_ros_service";
         public const string k_SysCommand_RemoveUnityService = "__remove_unity_service";
 
+        // Action support - requires patched ROS-TCP-Endpoint
+        // (comoc/ROS-TCP-Endpoint, main-ros2 branch)
+        public const string k_SysCommand_ActionClient = "__action_client";
+        public const string k_SysCommand_ActionSendGoal = "__action_send_goal";
+        public const string k_SysCommand_ActionGetResult = "__action_get_result";
+        public const string k_SysCommand_ActionCancelGoal = "__action_cancel_goal";
+        public const string k_SysCommand_ActionServer = "__action_server";
+        public const string k_SysCommand_ActionPublishFeedback = "__action_publish_feedback";
+
         public abstract string Command
         {
             get;
@@ -110,5 +119,24 @@ namespace Unity.Robotics.ROSTCPConnector
         public string message_name;
         public int queue_size;
         public bool latch;
+    }
+
+    // Action support structures
+    public struct SysCommand_ActionRegistration
+    {
+        public string action_name;
+        public string action_type;
+    }
+
+    public struct SysCommand_ActionGoalOp
+    {
+        public string action_name;
+        public int srv_id;
+    }
+
+    public struct SysCommand_ActionFeedback
+    {
+        public string action_name;
+        public string goal_uuid_hex;
     }
 }
